@@ -12,8 +12,8 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // Store connected clients
-const senders = new Map();    // Tablets sending audio: Map<ws, {id, name, connectedAt}>
-const receivers = new Map();  // Phone receiving audio: Map<ws, {selectedSender}>
+const senders = new Map();    // Tablets sending audio: Map<ws, {id, name, connectedAt, lastHeartbeat}>
+const receivers = new Map();  // Phone receiving audio: Map<ws, {selectedSender, lastHeartbeat}>
 
 // Statistics
 let stats = {
@@ -157,13 +157,30 @@ wss.on('connection', (ws, req) => {
             
             if (clientType === 'sender') {
               const deviceName = message.deviceName || `Tablet-${clientId.substr(0, 6)}`;
+              
+              // Remove any existing sender with the same device name (prevents duplicates)
+              let removedOldConnection = false;
+              senders.forEach((senderInfo, oldWs) => {
+                if (senderInfo.name === deviceName && oldWs !== ws) {
+                  console.log(`[${new Date().toISOString()}] Removing old connection for ${deviceName}`);
+                  senders.delete(oldWs);
+                  try {
+                    oldWs.close();
+                  } catch (e) {
+                    // Connection already closed
+                  }
+                  removedOldConnection = true;
+                }
+              });
+              
               senders.set(ws, {
                 id: clientId,
                 name: deviceName,
-                connectedAt: Date.now()
+                connectedAt: Date.now(),
+                lastHeartbeat: Date.now()
               });
               stats.activeSenders = senders.size;
-              console.log(`[${new Date().toISOString()}] SENDER connected: ${deviceName} (ID: ${clientId})`);
+              console.log(`[${new Date().toISOString()}] SENDER connected: ${deviceName} (ID: ${clientId})${removedOldConnection ? ' [replaced old connection]' : ''}`);
               
               ws.send(JSON.stringify({ 
                 type: 'identified', 
@@ -178,7 +195,8 @@ wss.on('connection', (ws, req) => {
             } else if (clientType === 'receiver') {
               receivers.set(ws, {
                 selectedSender: null, // null = listen to all (first sender by default)
-                connectedAt: Date.now()
+                connectedAt: Date.now(),
+                lastHeartbeat: Date.now()
               });
               stats.activeReceivers = receivers.size;
               console.log(`[${new Date().toISOString()}] RECEIVER connected (ID: ${clientId})`);
@@ -209,8 +227,16 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
-          // Keep-alive ping
+          // Keep-alive ping/heartbeat
           if (message.type === 'ping') {
+            // Update heartbeat timestamp
+            if (clientType === 'sender') {
+              const senderInfo = senders.get(ws);
+              if (senderInfo) senderInfo.lastHeartbeat = Date.now();
+            } else if (clientType === 'receiver') {
+              const receiverInfo = receivers.get(ws);
+              if (receiverInfo) receiverInfo.lastHeartbeat = Date.now();
+            }
             ws.send(JSON.stringify({ type: 'pong' }));
             return;
           }
@@ -224,6 +250,9 @@ wss.on('connection', (ws, req) => {
       if (clientType === 'sender') {
         stats.bytesRelayed += data.length;
         const senderInfo = senders.get(ws);
+        
+        // Update heartbeat when audio data is received
+        if (senderInfo) senderInfo.lastHeartbeat = Date.now();
         
         receivers.forEach((receiverInfo, receiverWs) => {
           if (receiverWs.readyState === 1) { // WebSocket.OPEN
@@ -323,6 +352,47 @@ server.listen(PORT, () => {
   console.log(`WebSocket: ws://localhost:${PORT}`);
   console.log('========================================');
 });
+
+// Heartbeat checker - remove stale connections every 30 seconds
+setInterval(() => {
+  const now = Date.now();
+  const timeout = 60000; // 60 seconds timeout
+  
+  // Check senders
+  let staleCount = 0;
+  senders.forEach((senderInfo, ws) => {
+    if (now - senderInfo.lastHeartbeat > timeout) {
+      console.log(`[${new Date().toISOString()}] Removing stale sender: ${senderInfo.name} (no activity for 60s)`);
+      senders.delete(ws);
+      try {
+        ws.close();
+      } catch (e) {
+        // Already closed
+      }
+      staleCount++;
+    }
+  });
+  
+  if (staleCount > 0) {
+    stats.activeSenders = senders.size;
+    broadcastSenderList();
+  }
+  
+  // Check receivers
+  receivers.forEach((receiverInfo, ws) => {
+    if (now - receiverInfo.lastHeartbeat > timeout) {
+      console.log(`[${new Date().toISOString()}] Removing stale receiver (no activity for 60s)`);
+      receivers.delete(ws);
+      try {
+        ws.close();
+      } catch (e) {
+        // Already closed
+      }
+    }
+  });
+  stats.activeReceivers = receivers.size;
+  
+}, 30000); // Check every 30 seconds
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
