@@ -12,8 +12,8 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // Store connected clients
-const senders = new Map();    // Tablets sending audio: Map<ws, {id, name, connectedAt, lastHeartbeat}>
-const receivers = new Map();  // Phone receiving audio: Map<ws, {selectedSender, lastHeartbeat}>
+const senders = new Map();    // Tablets sending audio: Map<ws, {id, name, connectedAt, lastHeartbeat, sampleRate, quality}>
+const receivers = new Map();  // Phone receiving audio: Map<ws, {selectedSender, lastHeartbeat, qualityPreference}>
 
 // Statistics
 let stats = {
@@ -173,11 +173,16 @@ wss.on('connection', (ws, req) => {
                 }
               });
               
+              const sampleRate = message.sampleRate || 48000;
+              const quality = message.quality || 'medium';
+              
               senders.set(ws, {
                 id: clientId,
                 name: deviceName,
                 connectedAt: Date.now(),
-                lastHeartbeat: Date.now()
+                lastHeartbeat: Date.now(),
+                sampleRate: sampleRate,
+                quality: quality
               });
               stats.activeSenders = senders.size;
               console.log(`[${new Date().toISOString()}] SENDER connected: ${deviceName} (ID: ${clientId})${removedOldConnection ? ' [replaced old connection]' : ''}`);
@@ -193,10 +198,13 @@ wss.on('connection', (ws, req) => {
               broadcastSenderList();
               
             } else if (clientType === 'receiver') {
+              const qualityPreference = message.qualityPreference || 'medium';
+              
               receivers.set(ws, {
                 selectedSender: null, // null = listen to all (first sender by default)
                 connectedAt: Date.now(),
-                lastHeartbeat: Date.now()
+                lastHeartbeat: Date.now(),
+                qualityPreference: qualityPreference
               });
               stats.activeReceivers = receivers.size;
               console.log(`[${new Date().toISOString()}] RECEIVER connected (ID: ${clientId})`);
@@ -222,6 +230,37 @@ wss.on('connection', (ws, req) => {
               ws.send(JSON.stringify({ 
                 type: 'senderSelected', 
                 senderId: message.senderId 
+              }));
+            }
+            return;
+          }
+          
+          // Receiver changes quality preference
+          if (message.type === 'changeQuality' && clientType === 'receiver') {
+            const receiverInfo = receivers.get(ws);
+            if (receiverInfo) {
+              const quality = message.quality || 'medium';
+              receiverInfo.qualityPreference = quality;
+              console.log(`[${new Date().toISOString()}] RECEIVER changed quality preference to: ${quality}`);
+              
+              // Tell all senders to switch quality
+              senders.forEach((senderInfo, senderWs) => {
+                if (senderWs.readyState === 1) {
+                  try {
+                    senderWs.send(JSON.stringify({
+                      type: 'changeQuality',
+                      quality: quality
+                    }));
+                  } catch (err) {
+                    console.error(`Error sending quality change to sender: ${err.message}`);
+                  }
+                }
+              });
+              
+              // Acknowledge
+              ws.send(JSON.stringify({
+                type: 'qualityChanged',
+                quality: quality
               }));
             }
             return;
@@ -307,7 +346,9 @@ function sendSenderList(receiverWs) {
   const senderList = Array.from(senders.values()).map(s => ({
     id: s.id,
     name: s.name,
-    connectedAt: s.connectedAt
+    connectedAt: s.connectedAt,
+    quality: s.quality || 'medium',
+    sampleRate: s.sampleRate || 48000
   }));
   
   try {
@@ -325,7 +366,9 @@ function broadcastSenderList() {
   const senderList = Array.from(senders.values()).map(s => ({
     id: s.id,
     name: s.name,
-    connectedAt: s.connectedAt
+    connectedAt: s.connectedAt,
+    quality: s.quality || 'medium',
+    sampleRate: s.sampleRate || 48000
   }));
   
   receivers.forEach((receiverInfo, receiverWs) => {
