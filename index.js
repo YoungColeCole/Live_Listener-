@@ -15,6 +15,10 @@ const wss = new WebSocketServer({ server });
 const senders = new Map();    // Tablets sending audio: Map<ws, {id, name, connectedAt, lastHeartbeat, sampleRate, quality}>
 const receivers = new Map();  // Phone receiving audio: Map<ws, {selectedSender, lastHeartbeat, qualityPreference}>
 
+// Store logs per device (last 200 entries per device)
+const deviceLogs = new Map(); // Map<deviceName, Array<{timestamp, level, message}>>
+const MAX_LOGS_PER_DEVICE = 200;
+
 // Statistics
 let stats = {
   totalConnections: 0,
@@ -277,6 +281,64 @@ wss.on('connection', (ws, req) => {
               if (receiverInfo) receiverInfo.lastHeartbeat = Date.now();
             }
             ws.send(JSON.stringify({ type: 'pong' }));
+            return;
+          }
+          
+          // Handle log messages from senders
+          if (message.type === 'log' && clientType === 'sender') {
+            const deviceName = message.deviceName || 'Unknown';
+            const logEntry = {
+              timestamp: message.timestamp || Date.now(),
+              level: message.level || 'info',
+              message: message.message || ''
+            };
+            
+            // Get or create log array for this device
+            if (!deviceLogs.has(deviceName)) {
+              deviceLogs.set(deviceName, []);
+            }
+            
+            const logs = deviceLogs.get(deviceName);
+            logs.push(logEntry);
+            
+            // Keep only last 200 entries
+            if (logs.length > MAX_LOGS_PER_DEVICE) {
+              logs.shift(); // Remove oldest
+            }
+            
+            console.log(`[${new Date().toISOString()}] LOG from ${deviceName} [${logEntry.level}]: ${logEntry.message}`);
+            return;
+          }
+          
+          // Receiver requests logs
+          if (message.type === 'getLogs' && clientType === 'receiver') {
+            const deviceName = message.deviceName || null;
+            
+            if (deviceName && deviceLogs.has(deviceName)) {
+              // Send logs for specific device
+              ws.send(JSON.stringify({
+                type: 'logs',
+                deviceName: deviceName,
+                logs: deviceLogs.get(deviceName)
+              }));
+            } else if (!deviceName) {
+              // Send all logs
+              const allLogs = {};
+              deviceLogs.forEach((logs, device) => {
+                allLogs[device] = logs;
+              });
+              ws.send(JSON.stringify({
+                type: 'logs',
+                allLogs: allLogs
+              }));
+            } else {
+              // No logs for this device
+              ws.send(JSON.stringify({
+                type: 'logs',
+                deviceName: deviceName,
+                logs: []
+              }));
+            }
             return;
           }
           
