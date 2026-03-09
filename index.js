@@ -191,16 +191,26 @@ wss.on('connection', (ws, req) => {
               stats.activeSenders = senders.size;
               console.log(`[${new Date().toISOString()}] SENDER connected: ${deviceName} (ID: ${clientId})${removedOldConnection ? ' [replaced old connection]' : ''}`);
               
-              ws.send(JSON.stringify({ 
-                type: 'identified', 
+              ws.send(JSON.stringify({
+                type: 'identified',
                 role: 'sender',
                 senderId: clientId,
                 deviceName: deviceName
               }));
-              
+
               // Notify all receivers about new sender
               broadcastSenderList();
-              
+
+              // On-demand: if any receiver is connected, tell this sender to start streaming
+              if (receivers.size > 0) {
+                try {
+                  ws.send(JSON.stringify({ type: 'startStreaming' }));
+                  console.log(`[${new Date().toISOString()}] Sent startStreaming to new sender: ${deviceName}`);
+                } catch (err) {
+                  console.error(`Error sending startStreaming: ${err.message}`);
+                }
+              }
+
             } else if (clientType === 'receiver') {
               const qualityPreference = message.qualityPreference || 'medium';
               
@@ -212,14 +222,17 @@ wss.on('connection', (ws, req) => {
               });
               stats.activeReceivers = receivers.size;
               console.log(`[${new Date().toISOString()}] RECEIVER connected (ID: ${clientId})`);
-              
-              ws.send(JSON.stringify({ 
-                type: 'identified', 
+
+              ws.send(JSON.stringify({
+                type: 'identified',
                 role: 'receiver'
               }));
-              
+
               // Send current sender list to this receiver
               sendSenderList(ws);
+
+              // On-demand: tell all senders to start streaming
+              broadcastStartStreaming();
             }
             
             return;
@@ -387,14 +400,19 @@ wss.on('connection', (ws, req) => {
       senders.delete(ws);
       stats.activeSenders = senders.size;
       console.log(`[${new Date().toISOString()}] SENDER disconnected: ${senderInfo?.name || clientId}`);
-      
+
       // Notify receivers that a sender disconnected
       broadcastSenderList();
-      
+
     } else if (clientType === 'receiver') {
       receivers.delete(ws);
       stats.activeReceivers = receivers.size;
       console.log(`[${new Date().toISOString()}] RECEIVER ${clientId} disconnected`);
+
+      // On-demand: if no receivers left, tell all senders to stop streaming
+      if (receivers.size === 0) {
+        broadcastStopStreaming();
+      }
     }
   });
 
@@ -421,6 +439,34 @@ function sendSenderList(receiverWs) {
   } catch (err) {
     console.error('Error sending sender list:', err.message);
   }
+}
+
+// On-demand: tell all senders to start streaming (receiver connected)
+function broadcastStartStreaming() {
+  senders.forEach((senderInfo, senderWs) => {
+    if (senderWs.readyState === 1) {
+      try {
+        senderWs.send(JSON.stringify({ type: 'startStreaming' }));
+        console.log(`[${new Date().toISOString()}] Sent startStreaming to: ${senderInfo.name}`);
+      } catch (err) {
+        console.error(`Error sending startStreaming to ${senderInfo.name}: ${err.message}`);
+      }
+    }
+  });
+}
+
+// On-demand: tell all senders to stop streaming (no receivers)
+function broadcastStopStreaming() {
+  senders.forEach((senderInfo, senderWs) => {
+    if (senderWs.readyState === 1) {
+      try {
+        senderWs.send(JSON.stringify({ type: 'stopStreaming' }));
+        console.log(`[${new Date().toISOString()}] Sent stopStreaming to: ${senderInfo.name}`);
+      } catch (err) {
+        console.error(`Error sending stopStreaming to ${senderInfo.name}: ${err.message}`);
+      }
+    }
+  });
 }
 
 // Helper function to broadcast sender list to all receivers
