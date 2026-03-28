@@ -1,6 +1,8 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const fsp = require('fs').promises;
+const path = require('path');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const app = express();
@@ -25,8 +27,51 @@ const receivers = new Map(); // ws → { selectedSender, lastHeartbeat, qualityP
 const audioBuffers = new Map();
 const CHUNK_DURATION_MS = 300_000; // upload one file every 5 minutes per enabled device
 
-// Per-sender Ultimate (cloud upload) — Set of sender connection IDs
-const ultimateSenderIds = new Set();
+// Ultimate (cloud upload) — stable device names (survives sender WebSocket reconnects)
+const ultimateDeviceNames = new Set();
+
+// Persist Ultimate list across process restarts (set ULTIMATE_PERSIST_PATH for a mounted volume on PaaS)
+const ULTIMATE_PERSIST_FILE = process.env.ULTIMATE_PERSIST_PATH
+  ? path.resolve(process.env.ULTIMATE_PERSIST_PATH)
+  : path.join(process.cwd(), 'data', 'ultimate-devices.json');
+
+async function loadUltimateDeviceNamesFromDisk() {
+  try {
+    const raw = await fsp.readFile(ULTIMATE_PERSIST_FILE, 'utf8');
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) {
+      console.warn('[ULTIMATE] Persist file ignored: expected a JSON array');
+      return;
+    }
+    ultimateDeviceNames.clear();
+    for (const x of arr) {
+      if (typeof x === 'string' && x.length > 0 && x.length < 512) {
+        ultimateDeviceNames.add(x);
+      }
+    }
+    console.log(`[ULTIMATE] Restored ${ultimateDeviceNames.size} device name(s) from ${ULTIMATE_PERSIST_FILE}`);
+  } catch (e) {
+    if (e.code !== 'ENOENT') {
+      console.error(`[ULTIMATE] Load failed: ${e.message}`);
+    }
+  }
+}
+
+async function persistUltimateDeviceNames() {
+  try {
+    const dir = path.dirname(ULTIMATE_PERSIST_FILE);
+    await fsp.mkdir(dir, { recursive: true });
+    const arr = [...ultimateDeviceNames].sort();
+    const tmp = `${ULTIMATE_PERSIST_FILE}.${process.pid}.tmp`;
+    await fsp.writeFile(tmp, `${JSON.stringify(arr)}\n`, 'utf8');
+    await fsp.rename(tmp, ULTIMATE_PERSIST_FILE);
+  } catch (e) {
+    console.error(`[ULTIMATE] Save failed: ${e.message}`);
+  }
+}
+
+// Disconnected-by-receiver — senders with this deviceName are rejected until unblocked
+const blockedDeviceNames = new Set();
 
 // Logs per device
 const deviceLogs = new Map();
@@ -66,6 +111,23 @@ function buildWavHeader(dataLength, sampleRate) {
   return buf;
 }
 
+/** Mono 16-bit PCM: duration from raw PCM byte length */
+function pcmDurationSeconds(pcmByteLength, sampleRate) {
+  const bytesPerFrame = 2; // mono int16
+  return pcmByteLength / (sampleRate * bytesPerFrame);
+}
+
+/** Filename-safe label, e.g. 5m12s, 1h06m03s */
+function formatDurationForFilename(totalSeconds) {
+  const s = Math.max(0, Math.round(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h${m}m${sec}s`;
+  if (m > 0) return `${m}m${sec}s`;
+  return `${sec}s`;
+}
+
 // ─── R2 upload helper ────────────────────────────────────────────────────────
 async function uploadToR2(senderName, sampleRate, pcmChunks, startTime) {
   try {
@@ -76,21 +138,32 @@ async function uploadToR2(senderName, sampleRate, pcmChunks, startTime) {
     const wavHeader = buildWavHeader(pcmData.length, sampleRate);
     const wavData = Buffer.concat([wavHeader, pcmData]);
 
+    const durationSec = pcmDurationSeconds(pcmData.length, sampleRate);
+    const durationLabel = formatDurationForFilename(durationSec);
+
     const date = new Date(startTime);
     const dateStr = date.toISOString().slice(0, 10);                         // YYYY-MM-DD
     const timeStr = date.toISOString().slice(11, 19).replace(/:/g, '-');     // HH-MM-SS
+    const isoStart = date.toISOString().replace(/:/g, '-');                 // full UTC for metadata / logs
     const safeName = senderName.replace(/[^a-zA-Z0-9_\-]/g, '_');
-    const key = `${safeName}/${dateStr}/${timeStr}.wav`;
+    // e.g. Google-Pixel_4/2026-03-28/2026-03-28_04-12-12_5m12s_24kHz.wav
+    const key = `${safeName}/${dateStr}/${dateStr}_${timeStr}_${durationLabel}_${sampleRate}Hz.wav`;
 
     await r2.send(new PutObjectCommand({
       Bucket: R2_BUCKET,
       Key: key,
       Body: wavData,
       ContentType: 'audio/wav',
+      Metadata: {
+        'start-utc': isoStart,
+        'duration-seconds': String(Math.round(durationSec)),
+        'duration-label': durationLabel,
+        'sample-rate': String(sampleRate),
+      },
     }));
 
     stats.bytesUploaded += wavData.length;
-    console.log(`[R2] Uploaded ${key} (${(wavData.length / 1024).toFixed(1)} KB)`);
+    console.log(`[R2] Uploaded ${key} (${(wavData.length / 1024).toFixed(1)} KB, ~${durationLabel})`);
   } catch (err) {
     console.error(`[R2] Upload failed for ${senderName}: ${err.message}`);
   }
@@ -106,11 +179,11 @@ async function flushBuffer(senderName) {
   await uploadToR2(senderName, sampleRate, chunks, startTime);
 }
 
-// ─── Periodic flush: every minute, upload accumulated audio ─────────────────
+// ─── Periodic flush: every CHUNK_DURATION_MS, upload accumulated audio ───────
 setInterval(async () => {
-  if (ultimateSenderIds.size === 0) return;
+  if (ultimateDeviceNames.size === 0) return;
   for (const [, info] of senders) {
-    if (ultimateSenderIds.has(info.id)) {
+    if (ultimateDeviceNames.has(info.name)) {
       await flushBuffer(info.name);
     }
   }
@@ -122,8 +195,8 @@ app.get('/', (req, res) => {
   const h = Math.floor(uptime / 3600);
   const m = Math.floor((uptime % 3600) / 60);
   const s = uptime % 60;
-  const modeStatus = ultimateSenderIds.size > 0
-    ? `<span style="color:#4CAF50">● ${ultimateSenderIds.size} device(s) uploading to cloud</span>`
+  const modeStatus = ultimateDeviceNames.size > 0
+    ? `<span style="color:#4CAF50">● ${ultimateDeviceNames.size} device name(s) in Ultimate (cloud) mode</span>`
     : `<span style="color:#f44336">● No devices in Ultimate (cloud) mode</span>`;
 
   res.send(`<!DOCTYPE html><html><head><title>Audio Relay</title>
@@ -150,7 +223,10 @@ app.get('/health', (req, res) => {
     status: 'ok',
     senders: stats.activeSenders,
     receivers: stats.activeReceivers,
-    ultimateEnabledSenderIds: [...ultimateSenderIds],
+    ultimateEnabledDeviceNames: [...ultimateDeviceNames],
+    ultimateEnabledSenderIds: Array.from(senders.values())
+      .filter((s) => ultimateDeviceNames.has(s.name))
+      .map((s) => s.id),
     uptime: Date.now() - stats.startTime,
   });
 });
@@ -182,6 +258,15 @@ wss.on('connection', (ws, req) => {
             if (clientType === 'sender') {
               const deviceName = message.deviceName || `Device-${clientId.substr(0, 6)}`;
 
+              if (blockedDeviceNames.has(deviceName)) {
+                console.log(`[BLOCK] Rejecting sender (blocked): ${deviceName}`);
+                try {
+                  ws.send(JSON.stringify({ type: 'blocked', reason: 'disconnected_by_receiver' }));
+                } catch {}
+                try { ws.close(4000, 'blocked'); } catch {}
+                return;
+              }
+
               // Remove stale connection with same name
               senders.forEach((info, oldWs) => {
                 if (info.name === deviceName && oldWs !== ws) {
@@ -204,8 +289,8 @@ wss.on('connection', (ws, req) => {
 
               ws.send(JSON.stringify({ type: 'identified', role: 'sender', senderId: clientId, deviceName }));
 
-              // Per-sender Ultimate (cloud recording)
-              ws.send(JSON.stringify({ type: 'ultimateModeState', active: ultimateSenderIds.has(clientId) }));
+              // Per-sender Ultimate (cloud recording) — keyed by stable device name
+              ws.send(JSON.stringify({ type: 'ultimateModeState', active: ultimateDeviceNames.has(deviceName) }));
 
               broadcastSenderList();
 
@@ -228,8 +313,9 @@ wss.on('connection', (ws, req) => {
               console.log(`[RECEIVER] connected (id=${clientId})`);
 
               ws.send(JSON.stringify({ type: 'identified', role: 'receiver' }));
-              ws.send(JSON.stringify({ type: 'ultimateModeState', active: ultimateSenderIds.size > 0 }));
+              ws.send(JSON.stringify({ type: 'ultimateModeState', active: ultimateDeviceNames.size > 0 }));
               sendSenderList(ws);
+              sendBlockedList(ws);
               broadcastStartStreaming();
             }
             return;
@@ -240,7 +326,7 @@ wss.on('connection', (ws, req) => {
             const info = receivers.get(ws);
             if (info) {
               info.selectedSender = message.senderId;
-              console.log(`[RECEIVER] selected sender: ${message.senderId || 'ALL'}`);
+              console.log(`[RECEIVER] selected sender: ${message.senderId == null ? 'none (muted)' : message.senderId}`);
               ws.send(JSON.stringify({ type: 'senderSelected', senderId: message.senderId }));
             }
             return;
@@ -303,21 +389,78 @@ wss.on('connection', (ws, req) => {
             senders.forEach((info, sWs) => {
               if (info.id !== senderId) return;
               if (enabled) {
-                ultimateSenderIds.add(senderId);
+                ultimateDeviceNames.add(info.name);
                 console.log(`[ULTIMATE] ENABLED for ${info.name} (${senderId})`);
+                audioBuffers.set(info.name, { chunks: [], startTime: Date.now(), sampleRate: info.sampleRate });
+                try { sWs.send(JSON.stringify({ type: 'ultimateModeState', active: true })); } catch {}
+                broadcastSenderList();
+                receivers.forEach((_, rWs) => {
+                  if (rWs.readyState === 1) {
+                    try { rWs.send(JSON.stringify({ type: 'ultimateModeState', active: ultimateDeviceNames.size > 0 })); } catch {}
+                  }
+                });
+                void persistUltimateDeviceNames();
               } else {
-                ultimateSenderIds.delete(senderId);
-                console.log(`[ULTIMATE] DISABLED for ${info.name} (${senderId})`);
+                (async () => {
+                  if (ultimateDeviceNames.has(info.name)) {
+                    await flushBuffer(info.name);
+                    ultimateDeviceNames.delete(info.name);
+                    console.log(`[ULTIMATE] DISABLED for ${info.name} (${senderId}) — flushed buffer`);
+                  } else {
+                    console.log(`[ULTIMATE] DISABLED for ${info.name} (${senderId})`);
+                  }
+                  audioBuffers.set(info.name, { chunks: [], startTime: Date.now(), sampleRate: info.sampleRate });
+                  try { sWs.send(JSON.stringify({ type: 'ultimateModeState', active: false })); } catch {}
+                  broadcastSenderList();
+                  receivers.forEach((_, rWs) => {
+                    if (rWs.readyState === 1) {
+                      try { rWs.send(JSON.stringify({ type: 'ultimateModeState', active: ultimateDeviceNames.size > 0 })); } catch {}
+                    }
+                  });
+                  await persistUltimateDeviceNames();
+                })();
               }
-              audioBuffers.set(info.name, { chunks: [], startTime: Date.now(), sampleRate: info.sampleRate });
-              try { sWs.send(JSON.stringify({ type: 'ultimateModeState', active: enabled })); } catch {}
             });
+            return;
+          }
+
+          // ── blockSender — kick device + reject reconnects until unblockSender ─
+          if (message.type === 'blockSender' && clientType === 'receiver') {
+            const senderId = message.senderId;
+            if (!senderId) return;
+            for (const [sWs, info] of senders) {
+              if (info.id !== senderId) continue;
+              blockedDeviceNames.add(info.name);
+              if (ultimateDeviceNames.has(info.name)) {
+                flushBuffer(info.name).catch(() => {});
+                ultimateDeviceNames.delete(info.name);
+                void persistUltimateDeviceNames();
+              }
+              senders.delete(sWs);
+              stats.activeSenders = senders.size;
+              console.log(`[BLOCK] ${info.name} blocked and disconnected`);
+              try { sWs.send(JSON.stringify({ type: 'blocked', reason: 'disconnected_by_receiver' })); } catch {}
+              try { sWs.close(4000, 'blocked'); } catch {}
+              break;
+            }
             broadcastSenderList();
+            broadcastBlockedList();
             receivers.forEach((_, rWs) => {
               if (rWs.readyState === 1) {
-                try { rWs.send(JSON.stringify({ type: 'ultimateModeState', active: ultimateSenderIds.size > 0 })); } catch {}
+                try { rWs.send(JSON.stringify({ type: 'ultimateModeState', active: ultimateDeviceNames.size > 0 })); } catch {}
               }
             });
+            return;
+          }
+
+          // ── unblockSender — allow this deviceName to connect again ─
+          if (message.type === 'unblockSender' && clientType === 'receiver') {
+            const deviceName = message.deviceName;
+            if (deviceName) {
+              blockedDeviceNames.delete(deviceName);
+              console.log(`[BLOCK] Unblocked: ${deviceName}`);
+            }
+            broadcastBlockedList();
             return;
           }
 
@@ -327,178 +470,4 @@ wss.on('connection', (ws, req) => {
             const enabled  = message.enabled !== false; // default true
             senders.forEach((info, sWs) => {
               if (info.id === targetId && sWs.readyState === 1) {
-                info.sleeperOverridden = !enabled; // overridden = sleeper disabled
-                try { sWs.send(JSON.stringify({ type: 'setSleeperMode', enabled })); } catch {}
-                console.log(`[SLEEPER] ${info.name} sleeper mode: ${enabled ? 'ON' : 'OFF (live-only)'}`);
-              }
-            });
-            broadcastSenderList();
-            return;
-          }
-
-          // ── deactivateUltimateMode (from receiver) — clears ALL cloud uploads
-          if (message.type === 'deactivateUltimateMode' && clientType === 'receiver') {
-            (async () => {
-              for (const id of ultimateSenderIds) {
-                const info = Array.from(senders.values()).find((s) => s.id === id);
-                if (info) await flushBuffer(info.name);
-              }
-              ultimateSenderIds.clear();
-              console.log(`[ULTIMATE] All devices cleared from cloud mode`);
-              senders.forEach((info, sWs) => {
-                try { sWs.send(JSON.stringify({ type: 'ultimateModeState', active: false })); } catch {}
-              });
-              broadcastSenderList();
-              receivers.forEach((_, rWs) => {
-                if (rWs.readyState === 1) {
-                  try { rWs.send(JSON.stringify({ type: 'ultimateModeState', active: false })); } catch {}
-                }
-              });
-            })();
-            return;
-          }
-
-        } catch (e) {
-          // Not JSON — fall through to audio handling
-        }
-      }
-
-      // ── Binary audio data from sender ─────────────────────────────────────
-      if (clientType === 'sender') {
-        stats.bytesRelayed += data.length;
-        const senderInfo = senders.get(ws);
-        if (!senderInfo) return;
-
-        senderInfo.lastHeartbeat = Date.now();
-
-        // Buffer for R2 upload (per-device Ultimate)
-        if (ultimateSenderIds.has(senderInfo.id)) {
-          const buf = audioBuffers.get(senderInfo.name);
-          if (buf) buf.chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
-        }
-
-        // Relay to receivers
-        receivers.forEach((receiverInfo, receiverWs) => {
-          if (receiverWs.readyState !== 1) return;
-          const shouldRelay = receiverInfo.selectedSender === null || receiverInfo.selectedSender === senderInfo.id;
-          if (!shouldRelay) return;
-          try {
-            const header = Buffer.from(JSON.stringify({ senderId: senderInfo.id, senderName: senderInfo.name }) + '\n');
-            receiverWs.send(Buffer.concat([header, Buffer.isBuffer(data) ? data : Buffer.from(data)]));
-          } catch (err) {
-            console.error(`Error relaying to receiver: ${err.message}`);
-          }
-        });
-      }
-
-    } catch (err) {
-      console.error(`Error processing message: ${err.message}`);
-    }
-  });
-
-  ws.on('close', () => {
-    if (clientType === 'sender') {
-      const info = senders.get(ws);
-      if (info && ultimateSenderIds.has(info.id)) flushBuffer(info.name).catch(() => {});
-      if (info) ultimateSenderIds.delete(info.id);
-      senders.delete(ws);
-      stats.activeSenders = senders.size;
-      console.log(`[SENDER] disconnected: ${info?.name || clientId}`);
-      broadcastSenderList();
-    } else if (clientType === 'receiver') {
-      receivers.delete(ws);
-      stats.activeReceivers = receivers.size;
-      console.log(`[RECEIVER] disconnected: ${clientId}`);
-      if (receivers.size === 0) broadcastStopStreaming();
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error(`WebSocket error for ${clientId}: ${err.message}`);
-  });
-});
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-function makeSenderList() {
-  return Array.from(senders.values()).map(s => ({
-    id: s.id, name: s.name, connectedAt: s.connectedAt,
-    quality: s.quality || 'medium', sampleRate: s.sampleRate || 24000,
-    mode: s.mode || 'always-on', sleeperOverridden: s.sleeperOverridden || false,
-    ultimateCloudEnabled: ultimateSenderIds.has(s.id),
-  }));
-}
-
-function sendSenderList(receiverWs) {
-  try { receiverWs.send(JSON.stringify({ type: 'senderList', senders: makeSenderList() })); } catch {}
-}
-
-function broadcastSenderList() {
-  const list = makeSenderList();
-  receivers.forEach((_, rWs) => {
-    if (rWs.readyState === 1) {
-      try { rWs.send(JSON.stringify({ type: 'senderList', senders: list })); } catch {}
-    }
-  });
-}
-
-function broadcastStartStreaming() {
-  senders.forEach((info, sWs) => {
-    if (sWs.readyState === 1) {
-      try { sWs.send(JSON.stringify({ type: 'startStreaming' })); } catch {}
-    }
-  });
-}
-
-function broadcastStopStreaming() {
-  senders.forEach((info, sWs) => {
-    if (sWs.readyState === 1) {
-      try { sWs.send(JSON.stringify({ type: 'stopStreaming' })); } catch {}
-    }
-  });
-}
-
-// ─── Stale connection cleanup ─────────────────────────────────────────────────
-setInterval(() => {
-  const now = Date.now();
-  const timeout = 60_000;
-  let changed = false;
-
-  senders.forEach((info, ws) => {
-      if (now - info.lastHeartbeat > timeout) {
-      console.log(`[CLEANUP] Stale sender: ${info.name}`);
-      if (ultimateSenderIds.has(info.id)) flushBuffer(info.name).catch(() => {});
-      senders.delete(ws);
-      try { ws.close(); } catch {}
-      changed = true;
-    }
-  });
-  if (changed) { stats.activeSenders = senders.size; broadcastSenderList(); }
-
-  receivers.forEach((info, ws) => {
-    if (now - info.lastHeartbeat > timeout) {
-      console.log(`[CLEANUP] Stale receiver`);
-      receivers.delete(ws);
-      try { ws.close(); } catch {}
-    }
-  });
-  stats.activeReceivers = receivers.size;
-}, 30_000);
-
-// ─── Start ───────────────────────────────────────────────────────────────────
-server.listen(PORT, () => {
-  console.log('========================================');
-  console.log('🎙️  Audio Relay Server Started');
-  console.log('========================================');
-  console.log(`Port: ${PORT}`);
-  console.log(`R2 Bucket: ${R2_BUCKET}`);
-  console.log(`R2 Account: ${process.env.R2_ACCOUNT_ID || '(not set)'}`);
-  console.log('========================================');
-});
-
-process.on('SIGTERM', () => {
-  console.log('SIGTERM: flushing buffers and shutting down...');
-  (async () => {
-    for (const name of audioBuffers.keys()) await flushBuffer(name);
-    server.close(() => process.exit(0));
-  })();
-});
+                info.sleeperOverridden = !enabled; // overridden = sleeper disab
