@@ -279,13 +279,16 @@ wss.on('connection', (ws, req) => {
               const quality    = message.quality    || 'medium';
               const mode       = message.mode       || 'always-on';
 
+              const alwaysMicWhenScreenOff = message.alwaysMicWhenScreenOff === true;
+
               senders.set(ws, {
                 id: clientId, name: deviceName, connectedAt: Date.now(),
                 lastHeartbeat: Date.now(), sampleRate, quality, mode,
                 sleeperOverridden: false,
+                alwaysMicWhenScreenOff,
               });
               stats.activeSenders = senders.size;
-              console.log(`[SENDER] connected: ${deviceName} (mode=${mode})`);
+              console.log(`[SENDER] connected: ${deviceName} (mode=${mode}, alwaysMic=${alwaysMicWhenScreenOff})`);
 
               ws.send(JSON.stringify({ type: 'identified', role: 'sender', senderId: clientId, deviceName }));
 
@@ -298,6 +301,13 @@ wss.on('connection', (ws, req) => {
               if (receivers.size > 0) {
                 ws.send(JSON.stringify({ type: 'startStreaming' }));
               }
+
+              try {
+                ws.send(JSON.stringify({
+                  type: 'relaySelection',
+                  active: isSenderSelectedByAnyReceiver(clientId),
+                }));
+              } catch {}
 
               // Init audio buffer for this device
               if (!audioBuffers.has(deviceName)) {
@@ -317,6 +327,7 @@ wss.on('connection', (ws, req) => {
               sendSenderList(ws);
               sendBlockedList(ws);
               broadcastStartStreaming();
+              broadcastRelaySelectionToSenders();
             }
             return;
           }
@@ -328,6 +339,7 @@ wss.on('connection', (ws, req) => {
               info.selectedSender = message.senderId;
               console.log(`[RECEIVER] selected sender: ${message.senderId == null ? 'none (muted)' : message.senderId}`);
               ws.send(JSON.stringify({ type: 'senderSelected', senderId: message.senderId }));
+              broadcastRelaySelectionToSenders();
             }
             return;
           }
@@ -462,12 +474,4 @@ wss.on('connection', (ws, req) => {
             }
             broadcastBlockedList();
             return;
-          }
-
-          // ── setSleeperMode (from receiver, targeted at a specific sender) ──
-          if (message.type === 'setSleeperMode' && clientType === 'receiver') {
-            const targetId = message.senderId;
-            const enabled  = message.enabled !== false; // default true
-            senders.forEach((info, sWs) => {
-              if (info.id === targetId && sWs.readyState === 1) {
-                info.sleeperOverridden = !enabled; // overridden = sleeper disab
+   
