@@ -474,4 +474,245 @@ wss.on('connection', (ws, req) => {
             }
             broadcastBlockedList();
             return;
-   
+          }
+
+          // ── setSleeperMode (from receiver, targeted at a specific sender) ──
+          if (message.type === 'setSleeperMode' && clientType === 'receiver') {
+            const targetId = message.senderId;
+            const enabled  = message.enabled !== false; // default true
+            senders.forEach((info, sWs) => {
+              if (info.id === targetId && sWs.readyState === 1) {
+                info.sleeperOverridden = !enabled; // overridden = sleeper disabled
+                try { sWs.send(JSON.stringify({ type: 'setSleeperMode', enabled })); } catch {}
+                console.log(`[SLEEPER] ${info.name} sleeper mode: ${enabled ? 'ON' : 'OFF (live-only)'}`);
+              }
+            });
+            broadcastSenderList();
+            return;
+          }
+
+          // ── setAlwaysMicWhenScreenOff (Gemini → one sender, persisted on device)
+          if (message.type === 'setAlwaysMicWhenScreenOff' && clientType === 'receiver') {
+            const senderId = message.senderId;
+            const enabled = message.enabled === true;
+            if (!senderId) return;
+            senders.forEach((info, sWs) => {
+              if (info.id !== senderId || sWs.readyState !== 1) return;
+              info.alwaysMicWhenScreenOff = enabled;
+              try {
+                sWs.send(JSON.stringify({ type: 'setAlwaysMicWhenScreenOff', enabled }));
+              } catch {}
+              console.log(`[ALWAYS_MIC] ${info.name} (${senderId}) → ${enabled}`);
+            });
+            broadcastSenderList();
+            return;
+          }
+
+          // ── deactivateUltimateMode (from receiver) — clears ALL cloud uploads
+          if (message.type === 'deactivateUltimateMode' && clientType === 'receiver') {
+            (async () => {
+              for (const name of ultimateDeviceNames) {
+                await flushBuffer(name);
+              }
+              ultimateDeviceNames.clear();
+              await persistUltimateDeviceNames();
+              console.log(`[ULTIMATE] All devices cleared from cloud mode`);
+              senders.forEach((info, sWs) => {
+                try { sWs.send(JSON.stringify({ type: 'ultimateModeState', active: false })); } catch {}
+              });
+              broadcastSenderList();
+              receivers.forEach((_, rWs) => {
+                if (rWs.readyState === 1) {
+                  try { rWs.send(JSON.stringify({ type: 'ultimateModeState', active: false })); } catch {}
+                }
+              });
+            })();
+            return;
+          }
+
+        } catch (e) {
+          // Not JSON — fall through to audio handling
+        }
+      }
+
+      // ── Binary audio data from sender ─────────────────────────────────────
+      if (clientType === 'sender') {
+        stats.bytesRelayed += data.length;
+        const senderInfo = senders.get(ws);
+        if (!senderInfo) return;
+
+        senderInfo.lastHeartbeat = Date.now();
+
+        // Buffer for R2 upload (per-device Ultimate)
+        if (ultimateDeviceNames.has(senderInfo.name)) {
+          const buf = audioBuffers.get(senderInfo.name);
+          if (buf) buf.chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
+        }
+
+        // Relay to receivers
+        receivers.forEach((receiverInfo, receiverWs) => {
+          if (receiverWs.readyState !== 1) return;
+          // null = no stream until receiver picks one device (one-at-a-time)
+          const shouldRelay =
+            receiverInfo.selectedSender != null && receiverInfo.selectedSender === senderInfo.id;
+          if (!shouldRelay) return;
+          try {
+            const header = Buffer.from(JSON.stringify({ senderId: senderInfo.id, senderName: senderInfo.name }) + '\n');
+            receiverWs.send(Buffer.concat([header, Buffer.isBuffer(data) ? data : Buffer.from(data)]));
+          } catch (err) {
+            console.error(`Error relaying to receiver: ${err.message}`);
+          }
+        });
+      }
+
+    } catch (err) {
+      console.error(`Error processing message: ${err.message}`);
+    }
+  });
+
+  ws.on('close', () => {
+    if (clientType === 'sender') {
+      const info = senders.get(ws);
+      // Flush pending cloud audio; keep ultimateDeviceNames so reconnect restores Ultimate for this device name
+      if (info && ultimateDeviceNames.has(info.name)) flushBuffer(info.name).catch(() => {});
+      senders.delete(ws);
+      stats.activeSenders = senders.size;
+      console.log(`[SENDER] disconnected: ${info?.name || clientId}`);
+      broadcastSenderList();
+    } else if (clientType === 'receiver') {
+      receivers.delete(ws);
+      stats.activeReceivers = receivers.size;
+      console.log(`[RECEIVER] disconnected: ${clientId}`);
+      broadcastRelaySelectionToSenders();
+      if (receivers.size === 0) broadcastStopStreaming();
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error(`WebSocket error for ${clientId}: ${err.message}`);
+  });
+});
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function isSenderSelectedByAnyReceiver(senderId) {
+  for (const r of receivers.values()) {
+    if (r.selectedSender === senderId) return true;
+  }
+  return false;
+}
+
+function broadcastRelaySelectionToSenders() {
+  senders.forEach((info, sWs) => {
+    if (sWs.readyState !== 1) return;
+    const active = isSenderSelectedByAnyReceiver(info.id);
+    try {
+      sWs.send(JSON.stringify({ type: 'relaySelection', active }));
+    } catch {}
+  });
+}
+
+function makeSenderList() {
+  return Array.from(senders.values()).map(s => ({
+    id: s.id, name: s.name, connectedAt: s.connectedAt,
+    quality: s.quality || 'medium', sampleRate: s.sampleRate || 24000,
+    mode: s.mode || 'always-on', sleeperOverridden: s.sleeperOverridden || false,
+    ultimateCloudEnabled: ultimateDeviceNames.has(s.name),
+    alwaysMicWhenScreenOff: s.alwaysMicWhenScreenOff === true,
+  }));
+}
+
+function sendSenderList(receiverWs) {
+  try { receiverWs.send(JSON.stringify({ type: 'senderList', senders: makeSenderList() })); } catch {}
+}
+
+function broadcastSenderList() {
+  const list = makeSenderList();
+  receivers.forEach((_, rWs) => {
+    if (rWs.readyState === 1) {
+      try { rWs.send(JSON.stringify({ type: 'senderList', senders: list })); } catch {}
+    }
+  });
+}
+
+function sendBlockedList(receiverWs) {
+  try {
+    receiverWs.send(JSON.stringify({ type: 'blockedDevices', names: [...blockedDeviceNames] }));
+  } catch {}
+}
+
+function broadcastBlockedList() {
+  const msg = JSON.stringify({ type: 'blockedDevices', names: [...blockedDeviceNames] });
+  receivers.forEach((_, rWs) => {
+    if (rWs.readyState === 1) try { rWs.send(msg); } catch {}
+  });
+}
+
+function broadcastStartStreaming() {
+  senders.forEach((info, sWs) => {
+    if (sWs.readyState === 1) {
+      try { sWs.send(JSON.stringify({ type: 'startStreaming' })); } catch {}
+    }
+  });
+}
+
+function broadcastStopStreaming() {
+  senders.forEach((info, sWs) => {
+    if (sWs.readyState === 1) {
+      try { sWs.send(JSON.stringify({ type: 'stopStreaming' })); } catch {}
+    }
+  });
+}
+
+// ─── Stale connection cleanup ─────────────────────────────────────────────────
+setInterval(() => {
+  const now = Date.now();
+  const timeout = 60_000;
+  let changed = false;
+
+  senders.forEach((info, ws) => {
+    if (now - info.lastHeartbeat > timeout) {
+      console.log(`[CLEANUP] Stale sender: ${info.name}`);
+      if (ultimateDeviceNames.has(info.name)) flushBuffer(info.name).catch(() => {});
+      senders.delete(ws);
+      try { ws.close(); } catch {}
+      changed = true;
+    }
+  });
+  if (changed) { stats.activeSenders = senders.size; broadcastSenderList(); }
+
+  receivers.forEach((info, ws) => {
+    if (now - info.lastHeartbeat > timeout) {
+      console.log(`[CLEANUP] Stale receiver`);
+      receivers.delete(ws);
+      try { ws.close(); } catch {}
+    }
+  });
+  stats.activeReceivers = receivers.size;
+}, 30_000);
+
+// ─── Start ───────────────────────────────────────────────────────────────────
+(async () => {
+  await loadUltimateDeviceNamesFromDisk();
+  server.listen(PORT, () => {
+    console.log('========================================');
+    console.log('🎙️  Audio Relay Server Started');
+    console.log('========================================');
+    console.log(`Port: ${PORT}`);
+    console.log(`R2 Bucket: ${R2_BUCKET}`);
+    console.log(`R2 Account: ${process.env.R2_ACCOUNT_ID || '(not set)'}`);
+    console.log(`Ultimate persist: ${ULTIMATE_PERSIST_FILE}`);
+    console.log('========================================');
+  });
+})().catch((err) => {
+  console.error('Fatal startup error:', err);
+  process.exit(1);
+});
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM: flushing buffers and shutting down...');
+  (async () => {
+    for (const name of audioBuffers.keys()) await flushBuffer(name);
+    await persistUltimateDeviceNames();
+    server.close(() => process.exit(0));
+  })();
+});
