@@ -70,6 +70,9 @@ async function persistUltimateDeviceNames() {
   }
 }
 
+// Sleeper-override — stable by device name (survives sender WebSocket reconnects)
+const sleeperOverriddenDeviceNames = new Set();
+
 // Disconnected-by-receiver — senders with this deviceName are rejected until unblocked
 const blockedDeviceNames = new Set();
 
@@ -281,16 +284,23 @@ wss.on('connection', (ws, req) => {
 
               const alwaysMicWhenScreenOff = message.alwaysMicWhenScreenOff === true;
 
+              const restoredSleeper = sleeperOverriddenDeviceNames.has(deviceName);
               senders.set(ws, {
                 id: clientId, name: deviceName, connectedAt: Date.now(),
                 lastHeartbeat: Date.now(), sampleRate, quality, mode,
-                sleeperOverridden: false,
+                sleeperOverridden: restoredSleeper,
                 alwaysMicWhenScreenOff,
               });
               stats.activeSenders = senders.size;
               console.log(`[SENDER] connected: ${deviceName} (mode=${mode}, alwaysMic=${alwaysMicWhenScreenOff})`);
 
               ws.send(JSON.stringify({ type: 'identified', role: 'sender', senderId: clientId, deviceName }));
+
+              // Restore sleeper override if it was set before reconnect
+              if (restoredSleeper) {
+                ws.send(JSON.stringify({ type: 'setSleeperMode', enabled: false }));
+                console.log(`[SLEEPER] Restored override for ${deviceName} on reconnect`);
+              }
 
               // Per-sender Ultimate (cloud recording) — keyed by stable device name
               ws.send(JSON.stringify({ type: 'ultimateModeState', active: ultimateDeviceNames.has(deviceName) }));
@@ -483,8 +493,13 @@ wss.on('connection', (ws, req) => {
             senders.forEach((info, sWs) => {
               if (info.id === targetId && sWs.readyState === 1) {
                 info.sleeperOverridden = !enabled; // overridden = sleeper disabled
+                if (!enabled) {
+                  sleeperOverriddenDeviceNames.add(info.name);
+                } else {
+                  sleeperOverriddenDeviceNames.delete(info.name);
+                }
                 try { sWs.send(JSON.stringify({ type: 'setSleeperMode', enabled })); } catch {}
-                console.log(`[SLEEPER] ${info.name} sleeper mode: ${enabled ? 'ON' : 'OFF (live-only)'}`);
+                console.log(`[SLEEPER] ${info.name} sleeper mode: ${enabled ? 'ON' : 'OFF (live-only)'} (persisted by name)`);
               }
             });
             broadcastSenderList();
@@ -666,7 +681,7 @@ function broadcastStopStreaming() {
 // ─── Stale connection cleanup ─────────────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
-  const timeout = 60_000;
+  const timeout = 120_000;
   let changed = false;
 
   senders.forEach((info, ws) => {
